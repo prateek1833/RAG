@@ -24,24 +24,48 @@ from typing import List, Dict, Any, Optional
 
 import streamlit as st
 
-# Optional/lazy imports that may not exist in minimal environments
-try:
-    from langchain_community.embeddings import HuggingFaceEmbeddings
-    from langchain_community.vectorstores import Chroma
-    from langchain_community.document_loaders import TextLoader
-    from langchain.text_splitter import RecursiveCharacterTextSplitter
-except Exception as e:
-    # We'll report helpful error to the user later if these are needed
-    LANGCHAIN_IMPORT_ERROR = e
-else:
-    LANGCHAIN_IMPORT_ERROR = None
+# Robust imports for different langchain / langchain-community versions
+LANGCHAIN_IMPORT_ERROR = None
+TRANSFORMERS_IMPORT_ERROR = None
 
+# Try to import TextLoader, Chroma, HuggingFaceEmbeddings from common places
+TextLoader = None
+Chroma = None
+HuggingFaceEmbeddings = None
+RecursiveCharacterTextSplitter = None
+
+try:
+    # prefer official langchain paths
+    from langchain.document_loaders import TextLoader as _TextLoader
+    from langchain.text_splitter import RecursiveCharacterTextSplitter as _Splitter
+    from langchain.embeddings import HuggingFaceEmbeddings as _HFEmb
+    from langchain.vectorstores import Chroma as _Chroma
+    TextLoader = _TextLoader
+    RecursiveCharacterTextSplitter = _Splitter
+    HuggingFaceEmbeddings = _HFEmb
+    Chroma = _Chroma
+except Exception:
+    try:
+        # fallback to community package (older examples use this)
+        from langchain_community.document_loaders import TextLoader as _TextLoader
+        from langchain_community.embeddings import HuggingFaceEmbeddings as _HFEmb
+        from langchain_community.vectorstores import Chroma as _Chroma
+        from langchain.text_splitter import RecursiveCharacterTextSplitter as _Splitter
+        TextLoader = _TextLoader
+        RecursiveCharacterTextSplitter = _Splitter
+        HuggingFaceEmbeddings = _HFEmb
+        Chroma = _Chroma
+    except Exception as e:
+        # keep the exception for a helpful error message later
+        LANGCHAIN_IMPORT_ERROR = e
+        # leave the names as None so checks below can show helpful messages
+
+# transformers
 try:
     from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
 except Exception as e:
     TRANSFORMERS_IMPORT_ERROR = e
-else:
-    TRANSFORMERS_IMPORT_ERROR = None
+
 
 try:
     import nltk
@@ -205,6 +229,15 @@ def get_embedder(model_name: str = EMBED_MODEL):
 # ---------------- Document helpers ----------------
 
 def load_documents_from_folder(folder: Path = DEFAULT_DOCS_DIR) -> List:
+    if LANGCHAIN_IMPORT_ERROR:
+        st.error("LangChain imports failed on this environment. Details: " + str(LANGCHAIN_IMPORT_ERROR))
+        return []
+
+    if TextLoader is None:
+        st.error("TextLoader is not available in this environment. Make sure you have 'langchain' or 'langchain-community' installed.")
+        return []
+
+    # ... rest of function unchanged ...
     docs: List = []
     folder = Path(folder)
     if not folder.exists():
