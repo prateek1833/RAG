@@ -1,5 +1,11 @@
-python -m venv .venv
-source .venv/bin/activate      # on Windows: .venv\Scripts\activate
-pip install -r requirements.txt   # later
-# to create requirements.txt after installing dependencies:
-pip freeze > requirements.txt
+cat > requirements.txt <<'EOF'
+streamlit
+langchain
+chromadb
+openai
+sentence-transformers
+transformers
+pandas
+numpy
+tqdm
+EOF
