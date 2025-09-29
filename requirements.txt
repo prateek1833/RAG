@@ -2,7 +2,7 @@ streamlit
 openai
 langchain
 langchain-community
-chromadb
+chromadb==1.0.15
 sentence-transformers
 transformers
 torch
