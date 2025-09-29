@@ -1,11 +1,10 @@
-cat > requirements.txt <<'EOF'
 streamlit
+openai
 langchain
 chromadb
-openai
 sentence-transformers
 transformers
 pandas
 numpy
+python-dotenv
 tqdm
-EOF
