@@ -85,7 +85,7 @@ SPLIT_CHUNK_SIZE = int(os.getenv("RAG_SPLIT_CHUNK_SIZE", 1000))
 SPLIT_CHUNK_OVERLAP = int(os.getenv("RAG_SPLIT_CHUNK_OVERLAP", 200))
 DEFAULT_K = int(os.getenv("RAG_DEFAULT_K", 3))
 
-PROMPT_TEMPLATE_NORMAL = (
+PROMPT_TEMPLATE_COT = (
     "You are a helpful assistant. Use ONLY the following context:\n\n{context}\n\n"
     "Question: {query}\n\n"
     "Answer strictly from the context above. "
@@ -95,7 +95,7 @@ PROMPT_TEMPLATE_NORMAL = (
     "Keep each step to 1–2 short sentences.\n\nAnswer:"
 )
 
-PROMPT_TEMPLATE_COT = (
+PROMPT_TEMPLATE_NORMAL = (
     "You are an expert summarizer of sports events. Use ONLY the following context:\n\n{context}\n\n"
     "Question: {query}\n\n"
     "Answer in two parts:\n"
@@ -286,7 +286,7 @@ def load_chroma(persist_dir: Path = CHROMA_PERSIST_DIR, embedder=None):
 # ---------------- Streamlit UI and flow ----------------
 
 st.set_page_config(page_title="RAG Sports Event QA App", layout="centered")
-st.title("🔍 RAG: Sports Event Report App (Polished)")
+st.title("🔍 RAG: Sports Event Report App")
 st.caption("Retrieval-Augmented Generation for sports event QA. Load docs -> build index -> ask questions.")
 
 # Sidebar controls
