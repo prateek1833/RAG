@@ -1,23 +1,18 @@
-# rag_app_fixed_polished.py
+# rag_app_fixed_polished_llm_judge_no_raw_eval.py
 """
 Polished, production-friendly RAG Streamlit app for sports-event QA.
-Features / fixes applied:
- - Robust model loading with helpful error messages
- - Uses Hugging Face pipeline object directly for generation (more predictable output)
- - Safer CPU/GPU device handling
- - Better session-state handling and UI controls (k, chunk size/overlap)
- - Clearer warnings when resources/models/files are missing
- - Graceful fallback for NLTK sentence tokenization
- - Cleaner output handling and trimming of duplicates
- - Add buttons: Load docs, Build index (rebuild), Clear DB
- - Requirements list and run instructions in comments
+Modified to use an LLM as an automatic judge that returns precision/recall/F1
+but with the following removals per user request:
+ - Do NOT display the LLM raw non-JSON output anywhere in the UI.
+ - Remove the optional "expected answer" manual input column.
 
-NOTE: This code aims to be robust across different environments but still
-requires the appropriate Python packages and models to be available.
-See the end of this file for quick run / install instructions.
+Other behavior remains: index creation, retrieval, generation, token-overlap metrics
+are kept as a fallback and shown to the user.
 """
+
 import os
 import re
+import json
 import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -106,6 +101,28 @@ PROMPT_TEMPLATE_NORMAL = (
     "Do NOT show internal reasoning. Only output the final answer.\n\nAnswer:"
 )
 
+PROMPT_TEMPLATE_EVAL = """You are an expert evaluator. Using ONLY the CONTEXT below, judge whether the claims made in the MODEL_ANSWER are supported by the CONTEXT.
+
+Return ONLY a valid JSON object wrapped inside a markdown json code block (i.e. ```json ... ```). The JSON must contain the keys:
+ - "precision": float (0.0-1.0)
+ - "recall": float (0.0-1.0)
+ - "f1": float
+ - "supported_claims": int
+ - "total_claims": int
+ - "missing_details": list[str]
+ - "rationale": str
+
+IMPORTANT: Do NOT output any prose outside the ```json``` block. If you cannot compute a metric, use null for that value.
+
+CONTEXT:
+{context}
+
+MODEL_ANSWER:
+{answer}
+
+OUTPUT:
+"""  # will be formatted with .format(context=context, answer=answer)
+
 # ---------------- Utilities ----------------
 
 logger = logging.getLogger(__name__)
@@ -131,7 +148,7 @@ def remove_repeated_sentences(text: str) -> str:
         else:
             raise Exception("nltk not available")
     except Exception:
-        sentences = [s.strip() for s in re.split(r"[\n\.]+", text) if s.strip()]
+        sentences = [s.strip() for s in re.split(r"[\n\.]+'", text) if s.strip()]
     seen = set()
     out = []
     for s in sentences:
@@ -169,6 +186,7 @@ def evaluate_response_detailed(pred: str, gold: str) -> Dict[str, Any]:
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
     return {"true_positive": tp, "false_positive": fp, "false_negative": fn,
             "precision": precision, "recall": recall, "f1": f1}
+
 
 # ---------------- Cached resources ----------------
 
@@ -226,6 +244,7 @@ def get_embedder(model_name: str = EMBED_MODEL):
     except Exception as e:
         raise RuntimeError(f"Failed to initialize embedder '{model_name}': {e}")
 
+
 # ---------------- Document helpers ----------------
 
 def load_documents_from_folder(folder: Path = DEFAULT_DOCS_DIR) -> List:
@@ -237,7 +256,6 @@ def load_documents_from_folder(folder: Path = DEFAULT_DOCS_DIR) -> List:
         st.error("TextLoader is not available in this environment. Make sure you have 'langchain' or 'langchain-community' installed.")
         return []
 
-    # ... rest of function unchanged ...
     docs: List = []
     folder = Path(folder)
     if not folder.exists():
@@ -283,10 +301,126 @@ def load_chroma(persist_dir: Path = CHROMA_PERSIST_DIR, embedder=None):
         return None
     return Chroma(persist_directory=str(persist_dir), embedding_function=embedder)
 
+
+# ---------------- Evaluation with LLM ----------------
+
+
+def _try_parse_json_from_text(text: str) -> Optional[Dict[str, Any]]:
+    """
+    Try to extract a JSON object from model output.
+    Steps:
+    1) Prefer an explicit ```json { ... } ``` code block and parse it.
+    2) Fallback to the first { ... } block and try lenient fixes (single->double quotes, remove trailing commas).
+    3) As a last resort, extract numeric metrics using regex (e.g., 'Precision: 0.8, Recall: 0.6, F1: 0.7').
+    Returns parsed dict on success, otherwise None.
+    """
+    if not text:
+        return None
+
+    # 1) look for explicit ```json { ... } ``` block
+    m = re.search(r"```json\s*(\{.*?\})\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        js = m.group(1)
+        try:
+            return json.loads(js)
+        except Exception:
+            pass
+
+    # 2) fallback to any {...} block
+    m2 = re.search(r"(\{.*\})", text, flags=re.DOTALL)
+    if m2:
+        js = m2.group(1)
+        try:
+            return json.loads(js)
+        except Exception:
+            # minor fixes: single quotes -> double, remove trailing commas
+            fixed = js.replace("'", '"')
+            fixed = re.sub(r",\s*\}", "}", fixed)
+            fixed = re.sub(r",\s*\]", "]", fixed)
+            try:
+                return json.loads(fixed)
+            except Exception:
+                pass
+
+    # 3) regex numeric extraction: Precision: 0.8, Recall=0.6, F1: 0.7
+    numeric = {}
+    m_prec = re.search(r"precision\s*[:=]\s*([0-9]*\.?[0-9]+)", text, flags=re.IGNORECASE)
+    m_rec = re.search(r"recall\s*[:=]\s*([0-9]*\.?[0-9]+)", text, flags=re.IGNORECASE)
+    m_f1 = re.search(r"f1\s*[:=]\s*([0-9]*\.?[0-9]+)", text, flags=re.IGNORECASE)
+    m_sup = re.search(r"supported[_\s]claims\s*[:=]\s*([0-9]+)", text, flags=re.IGNORECASE)
+    m_tot = re.search(r"total[_\s]claims\s*[:=]\s*([0-9]+)", text, flags=re.IGNORECASE)
+
+    if m_prec:
+        try:
+            numeric['precision'] = float(m_prec.group(1))
+        except Exception:
+            pass
+    if m_rec:
+        try:
+            numeric['recall'] = float(m_rec.group(1))
+        except Exception:
+            pass
+    if m_f1:
+        try:
+            numeric['f1'] = float(m_f1.group(1))
+        except Exception:
+            pass
+    if m_sup:
+        try:
+            numeric['supported_claims'] = int(m_sup.group(1))
+        except Exception:
+            pass
+    if m_tot:
+        try:
+            numeric['total_claims'] = int(m_tot.group(1))
+        except Exception:
+            pass
+
+    if numeric:
+        # fill missing keys with None / empty defaults
+        result = {
+            'precision': numeric.get('precision'),
+            'recall': numeric.get('recall'),
+            'f1': numeric.get('f1'),
+            'supported_claims': numeric.get('supported_claims'),
+            'total_claims': numeric.get('total_claims'),
+            'missing_details': [],
+            'rationale': None
+        }
+        return result
+
+    return None
+
+
+def evaluate_with_llm(llm_pipe, answer: str, context: str) -> Dict[str, Any]:
+    """Ask the LLM to act as a judge and return precision/recall/f1 + rationale.
+    Returns a dict with keys: precision, recall, f1, supported_claims, total_claims, missing_details, rationale
+    If parsing fails, returns an entry 'parsing_failed' and the raw output.
+    """
+    prompt = PROMPT_TEMPLATE_EVAL.format(context=context, answer=answer)
+    try:
+        outputs = llm_pipe(prompt, num_return_sequences=1, max_length=512)
+        raw = outputs[0].get("generated_text", "") if isinstance(outputs, list) and outputs else str(outputs)
+        parsed = _try_parse_json_from_text(raw)
+        if parsed:
+            # normalize numeric values
+            for k in ["precision", "recall", "f1"]:
+                if k in parsed:
+                    try:
+                        parsed[k] = float(parsed[k]) if parsed[k] is not None else None
+                    except Exception:
+                        parsed[k] = None
+            return {**parsed, "raw": raw}
+        else:
+            return {"parsing_failed": True, "raw": raw}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 # ---------------- Streamlit UI and flow ----------------
 
-st.set_page_config(page_title="RAG Sports Event QA App", layout="centered")
-st.title("🔍 RAG: Sports Event Report App")
+st.set_page_config(page_title="RAG Sports Event QA App (LLM Judge)", layout="centered")
+st.title("🔍 RAG: Sports Event Report App — LLM Judge")
 st.caption("Retrieval-Augmented Generation for sports event QA. Load docs -> build index -> ask questions.")
 
 # Sidebar controls
@@ -305,10 +439,10 @@ if "db_loaded" not in st.session_state:
     st.session_state["db_loaded"] = False
 if "last_result" not in st.session_state:
     st.session_state["last_result"] = ""
-if "ground_truth" not in st.session_state:
-    st.session_state["ground_truth"] = ""
 if "metrics" not in st.session_state:
     st.session_state["metrics"] = None
+if "llm_judge" not in st.session_state:
+    st.session_state["llm_judge"] = None
 
 # Top-level buttons
 col1, col2 = st.columns([1, 1])
@@ -406,13 +540,27 @@ if st.button("Ask"):
                         cleaned_result = clean_model_output(raw_answer)
 
                         st.session_state["last_result"] = cleaned_result
-                        st.session_state["ground_truth"] = ""
 
                         # Show retrieved snippets
                         st.markdown("**Retrieved source snippets (top k):**")
                         for i, doc in enumerate(docs[: int(k_results)], 1):
                             snippet = doc.page_content.strip().replace("\n", " ")
                             st.write(f"{i}. {snippet[:700]}{'...' if len(snippet) > 700 else ''}")
+
+                        # --- Automatic evaluation using LLM judge ---
+                        eval_res = evaluate_with_llm(llm_pipe, cleaned_result, context)
+                        if eval_res.get('error'):
+                            st.session_state['llm_judge'] = None
+                        elif eval_res.get('parsing_failed'):
+                            # Do not store or display raw non-JSON output; skip LLM judge display
+                            st.session_state['llm_judge'] = None
+                        else:
+                            # parsed JSON
+                            st.session_state['llm_judge'] = eval_res
+
+                        # Always compute token-overlap fallback metrics (context used as 'gold')
+                        token_metrics = evaluate_response_detailed(cleaned_result, context)
+                        st.session_state['metrics'] = token_metrics
 
             except Exception as e:
                 st.error(f"Error during retrieval/generation: {e}")
@@ -423,21 +571,33 @@ if st.session_state.get("last_result"):
     st.write("📢 **Answer:**")
     st.info(st.session_state["last_result"])
 
-    ground_truth = st.text_input("✍️ Enter expected answer (for F1/metrics evaluation):",
-                                 value=st.session_state.get("ground_truth", ""), key="ground_truth_input")
+    # Removed: manual ground-truth expected answer input (user requested removal)
 
-    if ground_truth != st.session_state.get("ground_truth", ""):
-        st.session_state["ground_truth"] = ground_truth
-        if ground_truth.strip():
-            st.session_state["metrics"] = evaluate_response_detailed(
-                st.session_state["last_result"], ground_truth
-            )
-        else:
-            st.session_state["metrics"] = None
+    # Show LLM judge results if available
+    if st.session_state.get('llm_judge'):
+        st.write('### 🤖 LLM Judge Results')
+        lj = st.session_state['llm_judge']
+        # only show parsed, trusted JSON metrics (no raw output shown anywhere)
+        p = lj.get('precision')
+        r = lj.get('recall')
+        f = lj.get('f1')
+        supported = lj.get('supported_claims')
+        total = lj.get('total_claims')
+        missing = lj.get('missing_details')
+        rationale = lj.get('rationale')
+        st.write(f"- **Precision (LLM judge):** {p if p is not None else 'N/A'}")
+        st.write(f"- **Recall (LLM judge):** {r if r is not None else 'N/A'}")
+        st.write(f"- **F1 (LLM judge):** {f if f is not None else 'N/A'}")
+        st.write(f"- **Supported claims:** {supported if supported is not None else 'N/A'} / {total if total is not None else 'N/A'}")
+        if missing:
+            st.write(f"- **Missing details:** {missing}")
+        if rationale:
+            st.write(f"- **Rationale:** {rationale}")
 
+    # Show token-overlap computed metrics
     if st.session_state.get("metrics"):
         m = st.session_state["metrics"]
-        st.write("### 📝 Evaluation Metrics")
+        st.write("### 📝 Token-overlap Metrics (fallback)")
         st.write(f"- **Precision:** {m['precision']:.2f}")
         st.write(f"- **Recall:** {m['recall']:.2f}")
         st.write(f"- **F1 Score:** {m['f1']:.2f}")
@@ -447,19 +607,3 @@ if st.session_state.get("last_result"):
             f"- **False Negatives:** {m['false_negative']}"
         )
 
-# ---------------- Run notes ----------------
-
-# Quick instructions (also copy/paste when deploying):
-# 1) Create a virtualenv and install requirements:
-#    pip install streamlit transformers sentencepiece accelerate torch --upgrade
-#    pip install langchain-community chromadb python-dotenv nltk
-# 2) Put your .txt documents inside the `docs/` folder (one or many files).
-# 3) Run: streamlit run rag_app_fixed_polished.py
-# 4) If you do not have internet or the model weights locally, loading large
-#    models like 'google/flan-t5-base' will fail. Consider using a smaller local
-#    model or run on a machine with internet access.
-
-# Optional: If NLTK complains, run once in Python REPL:
-#    import nltk; nltk.download('punkt')
-
-# End of file
